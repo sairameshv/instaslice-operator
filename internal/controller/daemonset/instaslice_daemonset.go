@@ -27,6 +27,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logr "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 )
@@ -138,6 +139,22 @@ func (r *InstaSliceDaemonsetReconciler) Reconcile(ctx context.Context, req ctrl.
 	if latestInstaslice.ResourceVersion != instaslice.ResourceVersion {
 		return ctrl.Result{}, nil
 	}
+	// get the node object to watch out for any related events
+	var node v1.Node
+	if err = r.Get(ctx, client.ObjectKey{Name: r.NodeName}, &node); err != nil {
+		log.Error(err, "error getting the node object", "name", r.NodeName)
+		return ctrl.Result{RequeueAfter: controller.Requeue1sDelay}, nil
+	}
+	// update the instaslice object with the Node object's current BootID
+	if instaslice.Status.NodeResources.BootID == "" {
+		originalInstaSliceObj := instaslice.DeepCopy()
+		instaslice.Status.NodeResources.BootID = node.Status.NodeInfo.BootID
+		err = r.Status().Patch(ctx, &instaslice, client.MergeFrom(originalInstaSliceObj)) // TODO - try with update
+		if err != nil {
+			log.Error(err, "error patching instaslice object with Boot ID of the Node ", "nodeName", r.NodeName, "bootId", node.Status.NodeInfo.BootID)
+			return ctrl.Result{RequeueAfter: controller.Requeue1sDelay}, nil
+		}
+	}
 
 	for podUID, allocResult := range instaslice.Status.PodAllocationResults {
 
@@ -185,8 +202,17 @@ func (r *InstaSliceDaemonsetReconciler) Reconcile(ctx context.Context, req ctrl.
 		}
 
 		// 2) Handle "creating"
+		var createReq bool
 		if allocResult.AllocationStatus.AllocationStatusController == inferencev1alpha1.AllocationStatusCreating &&
 			allocResult.Nodename == types.NodeName(r.NodeName) {
+			createReq = true
+		} else if (allocResult.AllocationStatus.AllocationStatusController != inferencev1alpha1.AllocationStatusDeleting) || (allocResult.AllocationStatus.AllocationStatusDaemonset != inferencev1alpha1.AllocationStatusDeleted) {
+			// handle the node reboot scenario
+			if instaslice.Status.NodeResources.BootID != node.Status.NodeInfo.BootID {
+				createReq = true
+			}
+		}
+		if createReq {
 
 			log.Info("creating allocation for pod", "podRef", podRef.Name)
 			// We can look up the *request* in spec to see the profile or resource demands
@@ -256,6 +282,16 @@ func (r *InstaSliceDaemonsetReconciler) Reconcile(ctx context.Context, req ctrl.
 			instaslice, err := r.getInstasliceObject(ctx, instaslice.Name, instaslice.Namespace)
 			if err != nil {
 				return ctrl.Result{RequeueAfter: controller.Requeue1sDelay}, nil
+			}
+			// update the boot id after all the required profiles are created
+			if instaslice.Status.NodeResources.BootID != node.Status.NodeInfo.BootID {
+				originalInstaSliceObj := instaslice.DeepCopy()
+				instaslice.Status.NodeResources.BootID = node.Status.NodeInfo.BootID
+				err = r.Status().Patch(ctx, instaslice, client.MergeFrom(originalInstaSliceObj))
+				if err != nil {
+					log.Error(err, "error patching instaslice object with Boot ID of the Node ", "nodeName", r.NodeName, "bootId", node.Status.NodeInfo.BootID)
+					return ctrl.Result{RequeueAfter: controller.Requeue1sDelay}, nil
+				}
 			}
 
 			// originalInstaSliceObj := instaslice.DeepCopy()
@@ -424,6 +460,7 @@ func (r *InstaSliceDaemonsetReconciler) SetupWithManager(mgr ctrl.Manager) error
 func (r *InstaSliceDaemonsetReconciler) setupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&inferencev1alpha1.Instaslice{}).Named("InstaSliceDaemonSet").
+		Watches(&v1.Node{}, &handler.EnqueueRequestForObject{}). // also watch out for node events
 		Complete(r)
 }
 
