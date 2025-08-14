@@ -243,3 +243,56 @@ func TestMutatePodNoResource(t *testing.T) {
 		t.Fatalf("env vars should not be added")
 	}
 }
+
+func TestInstasliceWebhook_mutatePod(t *testing.T) {
+	type args struct {
+		pod *corev1.Pod
+	}
+	populatePodwithMigprofile := func(profile string) *corev1.Pod {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: testName},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name:  testName,
+						Image: "ubuntu:20.04",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								corev1.ResourceName("nvidia.com/mig-" + profile): resource.MustParse("1"),
+							},
+						},
+					},
+				},
+			},
+		}
+		return pod
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+	}{
+		// Expect no error with a valid pod spec and the mig profile
+		{"testcase-1", args{populatePodwithMigprofile("1g.5gb")}, false},
+		// invalid mig profile
+		{"testcase-2", args{populatePodwithMigprofile("test")}, true},
+		// invalid profile format
+		{"testcase-3", args{populatePodwithMigprofile("1g.5GB")}, true},
+		// invalid profile format
+		{"testcase-4", args{populatePodwithMigprofile("g.5gb")}, true},
+		// invalid profile format
+		{"testcase-5", args{populatePodwithMigprofile("1g.5gb-me")}, true},
+		// valid profile format
+		{"testcase-6", args{populatePodwithMigprofile("1g.5gb+me")}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &InstasliceWebhook{}
+			_, err := s.mutatePod(tt.args.pod)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("mutatePod() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+		})
+	}
+}

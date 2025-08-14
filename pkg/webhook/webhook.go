@@ -2,7 +2,9 @@ package webhook
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 
 	admissionctl "sigs.k8s.io/controller-runtime/pkg/webhook/admission"
@@ -92,10 +94,15 @@ func (s *InstasliceWebhook) mutatePod(pod *corev1.Pod) ([]byte, error) {
 	klog.InfoS("Mutating Pod structure", "name", pod.Name, "namespace", pod.Namespace)
 	mutatedPod := pod.DeepCopy()
 	needsScheduler := false
+	var err error
 
-	mutateResources := func(c *corev1.Container) {
+	// Regular expression to validate both standard and media-extended MIG profiles.
+	// This pattern ensures the profile is in a format like "1g.5gb" or "1g.5gb+me".
+	migProfileRegex := regexp.MustCompile(`^\d+g\.\d+gb(\+me)?$`)
+
+	mutateResources := func(c *corev1.Container) error {
 		if c.Resources.Limits == nil {
-			return
+			return nil
 		}
 		klog.InfoS("checking container resources", "container", c.Name)
 		newLimits := corev1.ResourceList{}
@@ -106,6 +113,11 @@ func (s *InstasliceWebhook) mutatePod(pod *corev1.Pod) ([]byte, error) {
 			switch {
 			case strings.HasPrefix(key, "nvidia.com/mig-"):
 				profile := strings.TrimPrefix(key, "nvidia.com/mig-")
+				if !migProfileRegex.MatchString(profile) {
+					err := fmt.Errorf("invalid MIG profile format: %s", profile)
+					klog.ErrorS(err, "Mig profile validation failed", "container", c.Name)
+					return err
+				}
 				newKey := corev1.ResourceName("mig.das.com/" + profile)
 				klog.InfoS("renaming GPU resource", "from", key, "to", newKey)
 				newLimits[newKey] = qty
@@ -138,17 +150,27 @@ func (s *InstasliceWebhook) mutatePod(pod *corev1.Pod) ([]byte, error) {
 		if len(newRequests) > 0 {
 			c.Resources.Requests = newRequests
 		}
+		return nil
 	}
 
 	for i := range mutatedPod.Spec.Containers {
-		mutateResources(&mutatedPod.Spec.Containers[i])
+		err = mutateResources(&mutatedPod.Spec.Containers[i])
+		if err != nil {
+			return nil, err
+		}
 	}
 	for i := range mutatedPod.Spec.InitContainers {
-		mutateResources(&mutatedPod.Spec.InitContainers[i])
+		err = mutateResources(&mutatedPod.Spec.InitContainers[i])
+		if err != nil {
+			return nil, err
+		}
 	}
 	for i := range mutatedPod.Spec.EphemeralContainers {
 		c := (*corev1.Container)(&mutatedPod.Spec.EphemeralContainers[i].EphemeralContainerCommon)
-		mutateResources(c)
+		err = mutateResources(c)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if needsScheduler {
